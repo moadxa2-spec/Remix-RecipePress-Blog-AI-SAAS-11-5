@@ -1,0 +1,33 @@
+How to Use RecipePress Blog AI on Your Phone (Android & iOS)
+
+You can use our web application just like a native app on your phone for a seamless, on-the-go experience! By adding it to your home screen, you get a dedicated icon and a full-screen view without the browser's address bar.
+
+Here’s how to set it up in under a minute:
+
+---
+**For iPhone & iPad (iOS using Safari)**
+---
+
+1.  **Open Safari:** Launch the Safari browser and navigate to the RecipePress Blog AI application URL.
+
+2.  **Tap the Share Icon:** Look for the "Share" button. It's an icon with a square and an arrow pointing upwards, located at the bottom of the screen.
+
+3.  **Find "Add to Home Screen":** Scroll down in the share menu and tap on "Add to Home Screen".
+
+4.  **Name and Add:** You can customize the name of the app icon if you wish. Then, tap "Add" in the top-right corner.
+
+5.  **Done!** The RecipePress Blog AI icon will now appear on your home screen. You can tap it to launch the app directly, just like any other app.
+
+---
+**For Android (using Google Chrome)**
+---
+
+1.  **Open Chrome:** Launch the Chrome browser and navigate to the RecipePress Blog AI application URL.
+
+2.  **Tap the Menu Icon:** Look for the three-dot menu icon in the top-right corner of the browser.
+
+3.  **Find "Install app" or "Add to Home screen":** Tap on this option in the menu. The wording may vary slightly depending on your Chrome version.
+
+4.  **Confirm Installation:** A prompt will appear asking you to confirm. Tap "Install" or "Add".
+
+5.  **Done!** Chrome will add the RecipePress Blog AI icon to your home screen. You can now launch it for a full-screen, app-like experience.

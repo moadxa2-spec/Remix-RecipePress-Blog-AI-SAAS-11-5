@@ -1,0 +1,980 @@
+<?php
+/**
+ * Plugin Name:       RecipePress Blog AI Connector
+ * Description:       Provides secure API endpoints for the RecipePress Blog AI app to fetch posts and import recipes.
+ * Version:           2.25.0
+ * Author:            RecipePress Blog AI Team
+ * License:           GPL-2.0-or-later
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+final class RecipePress_AI_Connector_Remote {
+    private static $instance;
+    public static function instance() {
+        if ( is_null( self::$instance ) ) self::$instance = new self();
+        return self::$instance;
+    }
+
+    private $option_group = 'recipepress_ai_group';
+    private $menu_slug = 'recipepress-ai-dashboard';
+
+    private function __construct() {
+        add_action( 'admin_menu', [ $this, 'admin_menu' ] );
+        add_action( 'admin_init', [ $this, 'settings_init' ] );
+        add_action( 'rest_api_init', [ $this, 'add_cors_headers' ] );
+        add_action( 'rest_api_init', [ $this, 'register_rest_routes' ] );
+        add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_admin_assets' ] );
+        add_action( 'wp_ajax_rpai_generate_token', [ $this, 'ajax_generate_token' ] );
+    }
+
+    public function add_cors_headers() {
+        add_filter( 'rest_pre_serve_request', function ( $served, $result, $request ) {
+            // Only add headers to requests for our namespace to avoid interfering with other APIs.
+            if ( strpos( $request->get_route(), '/recipepress-ai/v1' ) !== false ) {
+                header( 'Access-Control-Allow-Origin: *' );
+                header( 'Access-Control-Allow-Methods: GET, POST, OPTIONS' );
+                header( 'Access-Control-Allow-Headers: Content-Type, Authorization' );
+            }
+            return $served;
+        }, 10, 3 );
+    }
+
+    private function log_debug($message) {
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            $log_file = WP_CONTENT_DIR . '/uploads/recipepress-atf.log';
+            $formatted_message = '[' . date('Y-m-d H:i:s') . '] ' . (is_array($message) || is_object($message) ? print_r($message, true) : $message) . "\n";
+            @file_put_contents($log_file, $formatted_message, FILE_APPEND);
+        }
+    }
+
+    public function enqueue_admin_assets($hook) {
+        if ($hook !== 'toplevel_page_' . $this->menu_slug) {
+            return;
+        }
+
+        wp_register_style('recipepress-admin-styles', false);
+        wp_enqueue_style('recipepress-admin-styles');
+        $css = "
+            :root { 
+                --rp-bg: #ffffff;
+                --rp-card-bg: #ffffff;
+                --rp-border: #e2e8f0;
+                --rp-input-bg: #ffffff;
+                --rp-text-heading: #1e293b;
+                --rp-text-body: #475569;
+                --rp-text-label: #334155;
+                --rp-accent: #8B5CF6;
+                --rp-accent-hover: #7C3AED;
+            }
+            html, body, #wpbody-content { background-color: var(--rp-bg); }
+            #wpcontent { padding-left: 0; }
+            #wpfooter { display: none; }
+            .wrap.recipepress-dashboard {
+                background-color: var(--rp-bg); color: var(--rp-text-body);
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen-Sans, Ubuntu, Cantarell, 'Helvetica Neue', sans-serif;
+                margin: 2rem auto; padding: 2rem; max-width: 1280px; box-sizing: border-box;
+            }
+            .recipepress-main-header { background-color: var(--rp-card-bg); border-radius: 0.75rem; padding: 1.5rem 2rem; margin-bottom: 2rem; display: flex; align-items: center; gap: 1.5rem; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1); border: 1px solid var(--rp-border); }
+            .recipepress-logo-wrapper { width: 48px; height: 48px; background-color: var(--rp-accent); border-radius: 0.5rem; display:flex; align-items:center; justify-content: center; flex-shrink: 0; }
+            .recipepress-logo { width: 32px; height: 32px; }
+            .recipepress-main-header h1 { font-size: 1.875rem; font-weight: 700; color: var(--rp-text-heading); margin: 0; line-height: 1.2; }
+            .recipepress-main-header p { font-size: 1rem; color: var(--rp-text-body); margin: 0.25rem 0 0; }
+            .recipepress-grid { display: grid; grid-template-columns: 1fr; gap: 2rem; }
+            @media (min-width: 768px) { .recipepress-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; } }
+            .recipepress-card { background: var(--rp-card-bg); border-radius: 0.75rem; border: 1px solid var(--rp-border); box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1); padding: 2rem; display: flex; flex-direction: column; height: 100%; }
+            .recipepress-card h2 { font-size: 1.25rem; font-weight: 600; color: var(--rp-text-heading); margin: 0; }
+            .recipepress-card .card-description { font-size: 0.875rem; color: var(--rp-text-body); margin: 0.25rem 0 1.5rem; }
+            .recipepress-card .card-content { flex-grow: 1; display: flex; flex-direction: column; justify-content: space-between; }
+            .form-group { margin-bottom: 1.5rem; }
+            .form-group:last-of-type { margin-bottom: 0; }
+            .form-group label { display: block; margin-bottom: 0.5rem; font-weight: 500; color: var(--rp-text-label); font-size: 0.875rem; }
+            .form-group .description { font-size: 0.875rem; color: var(--rp-text-body); margin-top: 0.5rem; }
+            input[type='text'].token-input { width: 100%; padding: 0.5rem 0.75rem; border: 1px solid var(--rp-border); border-radius: 0.375rem; background: var(--rp-input-bg); font-size: 0.875rem; box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05); color: var(--rp-text-body); transition: border-color 0.2s, box-shadow 0.2s; }
+            .recipepress-select-wrapper { position: relative; }
+            select.recipepress-select { -webkit-appearance: none; -moz-appearance: none; appearance: none; width: 100%; padding: 0.5rem 2.5rem 0.5rem 0.75rem; border: 1px solid var(--rp-border); border-radius: 0.375rem; background-color: var(--rp-input-bg); font-size: 0.875rem; box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05); color: var(--rp-text-body); transition: border-color 0.2s, box-shadow 0.2s; background-image: url(\"data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Cpath d='M7 9l3 3 3-3' stroke='%236B7280' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E\"); background-repeat: no-repeat; background-position: right 1rem center; background-size: 1em; }
+            input[type='text'].token-input:focus, select.recipepress-select:focus { outline: none; border-color: var(--rp-accent); box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.2); }
+            input[type='text'][readonly].token-input { background-color: #f8fafc; font-family: monospace; }
+            .token-wrapper { display: flex; gap: 0.5rem; }
+            .token-wrapper .button { white-space: nowrap; background-color: #f1f5f9 !important; border-color: #e2e8f0 !important; color: #334155; box-shadow: none !important; font-weight: 500; }
+            .token-wrapper .button:hover { background-color: #e2e8f0 !important; border-color: #cbd5e1 !important; }
+            .recipepress-card .submit-wrapper { margin-top: 1.5rem; text-align: left; }
+            .recipepress-card .submit { padding: 0; margin: 0; }
+            .recipepress-card .submit .button-primary { background-color: var(--rp-accent) !important; border-color: transparent !important; color: white; padding: 0.625rem 1.5rem !important; font-size: 0.875rem !important; height: auto !important; line-height: 1.25rem !important; border-radius: 0.375rem !important; font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,0.1); transition: background-color 0.2s; }
+            .recipepress-card .submit .button-primary:hover, .recipepress-card .submit .button-primary:focus { background-color: var(--rp-accent-hover) !important; border-color: transparent !important; box-shadow: 0 1px 2px rgba(0,0,0,0.1) !important; }
+            .wrap.recipepress-dashboard > h1 { display: none; }
+        ";
+        wp_add_inline_style('recipepress-admin-styles', $css);
+
+        wp_enqueue_script('jquery');
+        wp_add_inline_script('jquery', '
+            jQuery(document).ready(function($) {
+                $("#rpai-copy-token").on("click", function() {
+                    var tokenInput = $("#rpai_site_token");
+                    tokenInput.select();
+                    document.execCommand("copy");
+                    $(this).text("Copied!");
+                    setTimeout(() => $(this).text("Copy"), 2000);
+                });
+
+                $("#rpai-generate-token").on("click", function() {
+                    var $btn = $(this);
+                    $btn.prop("disabled", true).text("Generating...");
+                    $.post(ajaxurl, {
+                        action: "rpai_generate_token",
+                        _wpnonce: "' . wp_create_nonce('rpai_generate_token_nonce') . '"
+                    }, function(response) {
+                        if (response.success) {
+                            $("#rpai_site_token").val(response.data.token);
+                            $btn.prop("disabled", false).text("Generate New");
+                        } else {
+                            alert("Error: " . response.data.message);
+                            $btn.prop("disabled", false).text("Generate New");
+                        }
+                    });
+                });
+            });
+        ');
+    }
+
+    public function ajax_generate_token() {
+        check_ajax_referer('rpai_generate_token_nonce');
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => 'Permission denied.']);
+        }
+        $new_token = wp_generate_password(40, false);
+        update_option('recipepress_ai_site_token', $new_token);
+        wp_send_json_success(['token' => $new_token]);
+    }
+
+    public function admin_menu() {
+        $icon_svg = 'data:image/svg+xml;base64,' . base64_encode('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="#8B5CF6"><path fill-rule="evenodd" d="M11.385,2.467c-2.484,1.438-5.07,3.633-7.248,6.505c-1.218,1.606-2.023,3.36-2.43,5.163c-0.28,1.238,0.015,2.5,0.75,3.56c0.719,1.04,1.884,1.666,3.153,1.794c0.501,0.051,1,0.01,1.492-0.124c1.536-0.42,2.949-1.282,4.181-2.467c1.658-1.597,2.835-3.61,3.473-5.895c0.449-1.6,0.339-3.27-0.31-4.815c-0.286-0.684-0.66-1.304-1.109-1.838C12.351,5.29,11.838,3.905,11.385,2.467z M8.723,14.659c-0.78,0.28-1.602,0.203-2.342-0.213c-0.755-0.422-1.28-1.123-1.476-1.933c-0.256-1.063-0.012-2.179,0.658-3.125c0.556-0.799,1.236-1.499,1.999-2.181c0.08,0.177,0.163,0.352,0.25,0.525c0.4,0.806,0.999,1.536,1.751,2.138L8.723,14.659z M10.46,12.06c-0.583-1.029-0.767-2.208-0.51-3.321c0.122-0.536,0.362-1.04,0.695-1.492l0.227-0.306l0.277,0.145c0.495,0.26,0.945,0.591,1.329,0.999c1.559,1.655,2.289,3.844,1.956,5.981c-0.091,0.575-0.27,1.129-0.519,1.643L10.46,12.06z" clip-rule="evenodd"></path></svg>');
+        add_menu_page('RecipePress Blog AI', 'RecipePress Blog AI', 'manage_options', $this->menu_slug, [ $this, 'settings_page' ], $icon_svg, 25);
+    }
+
+    public function settings_init() {
+        if ( ! get_option('recipepress_ai_site_token') ) {
+            update_option('recipepress_ai_site_token', wp_generate_password(40,false));
+        }
+        if ( false === get_option('recipepress_ai_insert_position') ) {
+             update_option('recipepress_ai_insert_position', 'last');
+        }
+        register_setting( $this->option_group, 'recipepress_ai_site_token' );
+        register_setting( $this->option_group, 'recipepress_ai_post_author' );
+        register_setting( $this->option_group, 'recipepress_ai_insert_position' );
+    }
+
+    public function settings_page() {
+        if ( ! current_user_can('manage_options') ) return;
+        ?>
+        <div class="wrap recipepress-dashboard">
+            <div class="recipepress-main-header">
+                <div class="recipepress-logo-wrapper">
+                    <img src="<?php echo 'data:image/svg+xml;base64,' . base64_encode('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="#FFFFFF"><path fill-rule="evenodd" d="M11.385,2.467c-2.484,1.438-5.07,3.633-7.248,6.505c-1.218,1.606-2.023,3.36-2.43,5.163c-0.28,1.238,0.015,2.5,0.75,3.56c0.719,1.04,1.884,1.666,3.153,1.794c0.501,0.051,1,0.01,1.492-0.124c1.536-0.42,2.949-1.282,4.181-2.467c1.658-1.597,2.835-3.61,3.473-5.895c0.449-1.6,0.339-3.27-0.31-4.815c-0.286-0.684-0.66-1.304-1.109-1.838C12.351,5.29,11.838,3.905,11.385,2.467z M8.723,14.659c-0.78,0.28-1.602,0.203-2.342-0.213c-0.755-0.422-1.28-1.123-1.476-1.933c-0.256-1.063-0.012-2.179,0.658-3.125c0.556-0.799,1.236-1.499,1.999-2.181c0.08,0.177,0.163,0.352,0.25,0.525c0.4,0.806,0.999,1.536,1.751,2.138L8.723,14.659z M10.46,12.06c-0.583-1.029-0.767-2.208-0.51-3.321c0.122-0.536,0.362-1.04,0.695-1.492l0.227-0.306l0.277,0.145c0.495,0.26,0.945,0.591,1.329,0.999c1.559,1.655,2.289,3.844,1.956,5.981c-0.091,0.575-0.27,1.129-0.519,1.643L10.46,12.06z" clip-rule="evenodd"></path></svg>'); ?>" alt="RecipePress Blog AI Logo" class="recipepress-logo" />
+                </div>
+                <div>
+                    <h1>RecipePress Blog AI Dashboard</h1>
+                    <p>Manage your connection and settings.</p>
+                </div>
+            </div>
+            
+            <form method="post" action="options.php">
+                <?php settings_fields( $this->option_group ); ?>
+                <div class="recipepress-grid">
+                    <div class="recipepress-card">
+                        <div class="card-header">
+                            <h2>Connection Settings</h2>
+                            <p class="card-description">Configure how the app connects to this site.</p>
+                        </div>
+                        <div class="card-content">
+                            <div>
+                                <div class="form-group">
+                                    <label for="rpai_site_token">Site Token</label>
+                                    <div class="token-wrapper">
+                                        <input type="text" readonly id="rpai_site_token" name="recipepress_ai_site_token" class="token-input" value="<?php echo esc_attr( get_option('recipepress_ai_site_token') ); ?>" />
+                                        <button type="button" class="button" id="rpai-copy-token">Copy</button>
+                                        <button type="button" class="button" id="rpai-generate-token">Generate New</button>
+                                    </div>
+                                    <p class="description">Copy this token into your RecipePress AI app to connect this site.</p>
+                                </div>
+                            </div>
+                            <div class="submit-wrapper">
+                                <?php submit_button('Save Changes'); ?>
+                            </div>
+                        </div>
+                    </div>
+                     <div class="recipepress-card">
+                        <div class="card-header">
+                            <h2>Content Settings</h2>
+                            <p class="card-description">Control how recipes are created and placed.</p>
+                        </div>
+                        <div class="card-content">
+                            <div>
+                                <div class="form-group">
+                                    <label for="rpai_post_author">Default Post Author</label>
+                                    <div class="recipepress-select-wrapper">
+                                        <?php wp_dropdown_users(['name'=>'recipepress_ai_post_author', 'id' => 'rpai_post_author', 'class' => 'recipepress-select', 'selected'=>get_option('recipepress_ai_post_author'),'role__in'=>['Administrator','Editor'],'show_option_none'=>'— Select Author —']); ?>
+                                    </div>
+                                    <p class="description">This author will be assigned to all recipes created by the AI.</p>
+                                </div>
+                                <div class="form-group">
+                                    <label for="rpai_insert_position">Recipe Placement</label>
+                                    <div class="recipepress-select-wrapper">
+                                        <?php $pos = get_option('recipepress_ai_insert_position', 'last'); ?>
+                                        <select name="recipepress_ai_insert_position" id="rpai_insert_position" class="recipepress-select">
+                                            <option value="top" <?php selected($pos, 'top'); ?>>Top of Post</option>
+                                            <option value="middle" <?php selected($pos, 'middle'); ?>>Middle of Post</option>
+                                            <option value="last" <?php selected($pos, 'last'); ?>>Bottom of Post</option>
+                                        </select>
+                                    </div>
+                                    <p class="description">Choose where to insert the recipe card within the post content.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </form>
+        </div>
+        <?php
+    }
+
+    private function authenticate_post_request( WP_REST_Request $request ) {
+        $data = $request->get_json_params();
+        $sent_token = isset( $data['site_token'] ) ? $data['site_token'] : '';
+        $secret_key = get_option( 'recipepress_ai_site_token' );
+        if ( empty( $secret_key ) || empty( $sent_token ) || ! hash_equals( $secret_key, $sent_token ) ) {
+            return new WP_Error( 'invalid_token', 'Site Token is incorrect.', [ 'status' => 403 ] );
+        }
+        $author_id = get_option( 'recipepress_ai_post_author' );
+        if ( empty( $author_id ) ) {
+            return new WP_Error( 'author_not_set', 'A Default Post Author is not set in the plugin settings.', [ 'status' => 400 ] );
+        }
+        return [ 'data' => $data, 'author_id' => $author_id ];
+    }
+
+    private function authenticate_get_request( WP_REST_Request $request ) {
+        $sent_token = $request->get_header('Authorization');
+        if ($sent_token && preg_match('/Bearer\\s+(.*)/i', $sent_token, $matches)) {
+            $sent_token = $matches[1];
+        }
+        $secret_key = get_option( 'recipepress_ai_site_token' );
+        if ( empty( $secret_key ) || empty( $sent_token ) || ! hash_equals( $secret_key, $sent_token ) ) {
+            return new WP_Error( 'invalid_token', 'Site Token is incorrect.', [ 'status' => 403 ] );
+        }
+        return true;
+    }
+
+    private function has_recipe_card($post_content) {
+        // Check for Gutenberg blocks first
+        $recipe_block_names = [
+            'wp-tasty/tasty-recipe',
+            'wp-recipe-maker/recipe',
+            'create/recipe',
+            'zip-recipes/recipe-card',
+            'delicious-recipes/recipe-card-dynamic',
+            'recipe-card-blocks-by-wpzoom/recipe-card',
+            'whisk/recipe-card',
+            'food-blog-blocks/recipe-card',
+        ];
+        foreach ($recipe_block_names as $block_name) {
+            if (has_block($block_name, $post_content)) {
+                return true;
+            }
+        }
+
+        // Check for common recipe shortcodes
+        $recipe_shortcodes = [
+            'wprm-recipe', 'tasty-recipe', 'amd-zlrecipe-recipe', 'ultimate-recipe',
+            'yumprint-recipe', 'cooked-recipe', 'easyrecipe', 'recipe-card', 'zrdn-recipe-auto',
+        ];
+        foreach ($recipe_shortcodes as $shortcode) {
+            if (has_shortcode($post_content, $shortcode)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Return recipe details for a post content.
+     * Now accepts optional $post_id (used for logging or for looking up meta).
+     * Returns array: has_card, has_ingredients, has_instructions, recipe_id (int|null)
+     */
+    private function get_recipe_details_from_post_content($post_content, $post_id = 0) {
+        $details = [
+            'has_card' => false,
+            'has_ingredients' => false,
+            'has_instructions' => false,
+            'recipe_id' => null,
+        ];
+
+        if (!$this->has_recipe_card($post_content)) {
+            return $details;
+        }
+
+        $details['has_card'] = true;
+
+        // Default recipe_id null, try to find block with ID (Tasty)
+        $parsed_blocks = parse_blocks($post_content);
+        foreach ($parsed_blocks as $block) {
+            if ( empty($block['blockName']) ) continue;
+
+            // Tasty block
+            if ($block['blockName'] === 'wp-tasty/tasty-recipe' && isset($block['attrs']['id'])) {
+                $recipe_id = intval($block['attrs']['id']);
+                $details['recipe_id'] = $recipe_id;
+                if ($recipe_id > 0) {
+                    $tasty_data = get_post_meta($recipe_id, '_tasty_recipes_data', true);
+                    if (is_array($tasty_data)) {
+                        $ingredients = $tasty_data['recipeIngredient'] ?? [];
+                        if (is_array($ingredients)) {
+                            foreach ($ingredients as $item) {
+                                if (!empty(trim($item['raw'] ?? ''))) {
+                                    $details['has_ingredients'] = true;
+                                    break;
+                                }
+                            }
+                        }
+                        $instructions = $tasty_data['recipeInstructions'] ?? [];
+                        if (is_array($instructions)) {
+                            foreach ($instructions as $item) {
+                                if (!empty(trim($item['text'] ?? ''))) {
+                                    $details['has_instructions'] = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                // We found a Tasty block; exit loop
+                break;
+            }
+
+            // For other recipe-oriented blocks we keep recipe_id null but mark existence
+            // Additional block-specific parsing can be added here in future
+        }
+
+        // Fallback: if we detected a card but couldn't find details, assume content exists
+        if ($details['has_card'] && !$details['has_ingredients'] && !$details['has_instructions']) {
+            $details['has_ingredients'] = true;
+            $details['has_instructions'] = true;
+        }
+
+        return $details;
+    }
+
+    private function get_existing_recipe_id_from_post($post_id) {
+        $post = get_post($post_id);
+        if (!$post) return 0;
+        if (has_block('wp-tasty/tasty-recipe', $post->post_content)) {
+            $parsed_blocks = parse_blocks($post->post_content);
+            foreach ($parsed_blocks as $block) {
+                if ($block['blockName'] === 'wp-tasty/tasty-recipe' && isset($block['attrs']['id'])) {
+                    return intval($block['attrs']['id']);
+                }
+            }
+        }
+        return 0;
+    }
+
+    private function save_recipe_data( $recipe_data, $author_id, $parent_post_id, $existing_recipe_id = 0 ) {
+        $this->log_debug('Saving recipe data. Existing ID: ' . $existing_recipe_id . '. Parent Post ID: ' . $parent_post_id);
+
+        $normalize = function($val){
+            if ( is_array($val) ) return array_values(array_filter(array_map('trim',$val)));
+            if ( is_string($val) ) {
+                $s = trim($val);
+                $s = preg_replace('/[\\r\\n\\t]+/','\\n',$s);
+                $s = str_replace(["\u2022","\x95"], '-', $s);
+                $parts = preg_split('/\\n+|(?<=\\d\\.)\\s+|[-•\\*]\\s*/u', $s);
+                return array_values(array_filter(array_map('trim', $parts)));
+            }
+            return [];
+        };
+
+        $ingredients = $normalize($recipe_data['ingredients'] ?? []);
+        $instructions = $normalize($recipe_data['instructions'] ?? []);
+        $name = sanitize_text_field($recipe_data['name'] ?? 'Recipe');
+
+        $recipe_post = [
+            'post_title' => wp_strip_all_tags($name),
+            'post_status' => 'publish',
+            'post_author' => $author_id,
+        ];
+
+        if ($existing_recipe_id > 0) {
+            $recipe_post['ID'] = $existing_recipe_id;
+            wp_update_post($recipe_post);
+            $recipe_id = $existing_recipe_id;
+            $this->log_debug('Updated existing recipe post: ' . $recipe_id);
+        } else {
+            $recipe_post_type = post_type_exists('tasty_recipe') ? 'tasty_recipe' : 'tasty_recipes';
+            $recipe_post['post_type'] = $recipe_post_type;
+            $recipe_id = wp_insert_post($recipe_post, true);
+            if (is_wp_error($recipe_id)) {
+                $this->log_debug('Error creating new recipe post: ' . $recipe_id->get_error_message());
+                return $recipe_id;
+            }
+            $this->log_debug('Created new recipe post: ' . $recipe_id);
+        }
+
+        $tasty_data = [
+            'name' => $name,
+            'author' => sanitize_text_field($recipe_data['author'] ?? ''),
+            'description' => sanitize_text_field($recipe_data['description'] ?? ''),
+            'prepTime' => sanitize_text_field($recipe_data['prep_time'] ?? ''),
+            'cookTime' => sanitize_text_field($recipe_data['cook_time'] ?? ''),
+            'totalTime' => sanitize_text_field($recipe_data['total_time'] ?? ''),
+            'recipeYield' => sanitize_text_field($recipe_data['yield'] ?? ''),
+            'recipeCuisine' => sanitize_text_field($recipe_data['cuisine'] ?? ''),
+            'recipeCategory' => sanitize_text_field($recipe_data['category'] ?? ''),
+            'recipeMethod' => sanitize_text_field($recipe_data['method'] ?? ''),
+            'recipeDiet' => sanitize_text_field($recipe_data['diet'] ?? ''),
+            'keywords' => implode(', ', is_array($recipe_data['keywords']) ? $recipe_data['keywords'] : []),
+            'recipeIngredient' => array_map(function($i){ return ['raw'=> (string)$i]; }, $ingredients),
+            'recipeInstructions' => array_map(function($s){ return ['text'=> (string)$s]; }, $instructions),
+            'notes' => [ ['text' => sanitize_text_field($recipe_data['notes'] ?? '')] ],
+        ];
+        
+        if ( ! empty( $recipe_data['video_url'] ) && filter_var($recipe_data['video_url'], FILTER_VALIDATE_URL) ) {
+            $tasty_data['video'] = [ 'url' => esc_url_raw($recipe_data['video_url']) ];
+        }
+
+        if ( ! empty( $recipe_data['nutrition'] ) && is_array( $recipe_data['nutrition'] ) ) {
+            $sanitized_nutrition = [];
+            // Whitelist of allowed schema.org keys to prevent injection and ensure compatibility
+            $allowed_keys = [
+                'servingSize', 'calories', 'sugarContent', 'sodiumContent', 'fatContent',
+                'saturatedFatContent', 'unsaturatedFatContent', 'transFatContent',
+                'carbohydrateContent', 'fiberContent', 'proteinContent', 'cholesterolContent'
+            ];
+            foreach( $recipe_data['nutrition'] as $key => $value ) {
+                // Only process whitelisted keys and non-empty values
+                if ( in_array($key, $allowed_keys) && !empty($value) ) {
+                    // The key is trusted, just sanitize the value
+                    $sanitized_nutrition[$key] = sanitize_text_field($value);
+                }
+            }
+            if (!empty($sanitized_nutrition)) {
+                // Tasty plugin expects a 'nutrition' key with an object of values
+                $tasty_data['nutrition'] = $sanitized_nutrition;
+            }
+        }
+
+        if ( ! empty( $recipe_data['aggregateRating'] ) && is_array( $recipe_data['aggregateRating'] ) ) {
+            $sanitized_rating = [];
+            if ( isset( $recipe_data['aggregateRating']['ratingValue'] ) ) {
+                $sanitized_rating['ratingValue'] = sanitize_text_field($recipe_data['aggregateRating']['ratingValue']);
+            }
+            if ( isset( $recipe_data['aggregateRating']['ratingCount'] ) ) {
+                $sanitized_rating['ratingCount'] = intval($recipe_data['aggregateRating']['ratingCount']);
+            }
+            if ( !empty($sanitized_rating) ) {
+                $tasty_data['aggregateRating'] = $sanitized_rating;
+            }
+        }
+        
+        $thumb_id = 0;
+        // Step 1: Handle new image upload from the app.
+        if ( ! empty($recipe_data['image']) ) {
+            $this->log_debug('Attempting to upload image from data.');
+            require_once( ABSPATH . 'wp-admin/includes/file.php' );
+            require_once( ABSPATH . 'wp-admin/includes/media.php' );
+            require_once( ABSPATH . 'wp-admin/includes/image.php' );
+
+            $image_data = base64_decode($recipe_data['image']);
+            if ($image_data !== false) {
+                $file_name = sanitize_title($name) . '.jpg';
+                $upload = wp_upload_bits($file_name, null, $image_data);
+
+                if (empty($upload['error'])) {
+                    $file_path = $upload['file'];
+                    $file_type = wp_check_filetype($file_path, null);
+                    $attachment_data = array(
+                        'post_mime_type' => $file_type['type'],
+                        'post_title'     => sanitize_text_field($recipe_data['image_title'] ?? $name),
+                        'post_content'   => sanitize_text_field($recipe_data['image_description'] ?? $name),
+                        'post_excerpt'   => sanitize_text_field($recipe_data['image_description'] ?? $name),
+                        'post_status'    => 'inherit',
+                    );
+                    $attach_id = wp_insert_attachment($attachment_data, $file_path, $parent_post_id);
+                    if (!is_wp_error($attach_id)) {
+                        $thumb_id = $attach_id;
+                        $attach_data = wp_generate_attachment_metadata($attach_id, $file_path);
+                        wp_update_attachment_metadata($attach_id, $attach_data);
+                        $image_alt = sanitize_text_field($recipe_data['image_alt'] ?? $name);
+                        update_post_meta($attach_id, '_wp_attachment_image_alt', $image_alt);
+                        // If a new image was uploaded, it becomes the featured image for the parent post.
+                        set_post_thumbnail($parent_post_id, $thumb_id);
+                    }
+                } else {
+                     $this->log_debug('wp_upload_bits error: ' . ($upload['error'] ?? 'Unknown upload error'));
+                }
+            } else {
+                $this->log_debug('Failed to decode base64 image data.');
+            }
+        }
+        
+        // Step 2: If no new image was uploaded, try to use the parent post's existing featured image.
+        if ( ! $thumb_id && has_post_thumbnail($parent_post_id) ) {
+            $thumb_id = get_post_thumbnail_id($parent_post_id);
+            $this->log_debug('No new image provided. Using existing featured image ID: ' . $thumb_id);
+        }
+
+        // Step 3: If we have an image ID from any source, assign it to the recipe card itself.
+        if ($thumb_id) {
+            set_post_thumbnail($recipe_id, $thumb_id);
+
+            // Add image URL to Tasty data as a fallback
+            $img_url = wp_get_attachment_url( $thumb_id );
+            if ( $img_url ) {
+                $tasty_data['image'] = $img_url;
+            }
+        }
+
+        // Save the main serialized data array for modern Tasty Recipes versions
+        update_post_meta($recipe_id, '_tasty_recipes_data', $tasty_data);
+
+        // --- Compatibility Layer ---
+        // Save all fields as individual meta keys for maximum compatibility.
+        // For ingredients/instructions, we save a simple newline-separated string as a fallback.
+        update_post_meta($recipe_id, 'ingredients', implode("\n", $ingredients));
+        update_post_meta($recipe_id, 'instructions', implode("\n", $instructions));
+        update_post_meta($recipe_id, 'description', sanitize_text_field($recipe_data['description'] ?? ''));
+        update_post_meta($recipe_id, 'notes', sanitize_text_field($recipe_data['notes'] ?? ''));
+        update_post_meta($recipe_id, 'author_name', sanitize_text_field($recipe_data['author'] ?? ''));
+        update_post_meta($recipe_id, 'prep_time', sanitize_text_field($recipe_data['prep_time'] ?? ''));
+        update_post_meta($recipe_id, 'cook_time', sanitize_text_field($recipe_data['cook_time'] ?? ''));
+        update_post_meta($recipe_id, 'total_time', sanitize_text_field($recipe_data['total_time'] ?? ''));
+        update_post_meta($recipe_id, 'yield', sanitize_text_field($recipe_data['yield'] ?? ''));
+        update_post_meta($recipe_id, 'category', sanitize_text_field($recipe_data['category'] ?? ''));
+        update_post_meta($recipe_id, 'method', sanitize_text_field($recipe_data['method'] ?? ''));
+        update_post_meta($recipe_id, 'cuisine', sanitize_text_field($recipe_data['cuisine'] ?? ''));
+        update_post_meta($recipe_id, 'diet', sanitize_text_field($recipe_data['diet'] ?? ''));
+        update_post_meta($recipe_id, 'keywords', implode(', ', is_array($recipe_data['keywords']) ? $recipe_data['keywords'] : []));
+
+        if ( ! empty( $recipe_data['video_url'] ) && filter_var($recipe_data['video_url'], FILTER_VALIDATE_URL) ) {
+            update_post_meta($recipe_id, 'video_url', esc_url_raw($recipe_data['video_url']));
+        }
+
+        // Save individual nutrition fields with mapping
+        if ( ! empty( $recipe_data['nutrition'] ) && is_array( $recipe_data['nutrition'] ) ) {
+            $nutrition_map = [
+                'servingSize' => 'serving_size',
+                'calories' => 'calories',
+                'sugarContent' => 'sugar',
+                'sodiumContent' => 'sodium',
+                'fatContent' => 'fat',
+                'saturatedFatContent' => 'saturated_fat',
+                'unsaturatedFatContent' => 'unsaturated_fat',
+                'transFatContent' => 'trans_fat',
+                'carbohydrateContent' => 'carbohydrates',
+                'fiberContent' => 'fiber',
+                'proteinContent' => 'protein',
+                'cholesterolContent' => 'cholesterol',
+            ];
+            foreach( $nutrition_map as $app_key => $wp_key ) {
+                if ( isset($recipe_data['nutrition'][$app_key]) && !empty($recipe_data['nutrition'][$app_key]) ) {
+                    update_post_meta($recipe_id, $wp_key, sanitize_text_field($recipe_data['nutrition'][$app_key]));
+                }
+            }
+        }
+        // --- End Compatibility Layer ---
+        
+        return $recipe_id;
+    }
+
+    public function verify_connection_callback( WP_REST_Request $request ) {
+        $auth_result = $this->authenticate_post_request( $request );
+        if ( is_wp_error( $auth_result ) ) return $auth_result;
+        return new WP_REST_Response( [ 'success' => true, 'message' => 'Connection ok' ], 200 );
+    }
+
+    private function build_faq_block_from_schema($schema) {
+        if ( empty($schema) || !is_array($schema) || empty($schema['mainEntity']) || !is_array($schema['mainEntity']) ) {
+            return '';
+        }
+
+        $questions_for_block_attr = [];
+        $faq_items_html = '';
+
+        foreach ( $schema['mainEntity'] as $index => $item ) {
+            if ( !empty($item['name']) && !empty($item['acceptedAnswer']['text']) ) {
+                $question_title = esc_html( $item['name'] );
+                // Wrap answer in <p> tags for proper block rendering
+                $answer_text = '<p>' . wp_kses_post( $item['acceptedAnswer']['text'] ) . '</p>';
+
+                $faq_items_html .= sprintf(
+                    '<div class="rank-math-faq-item"><h3 class="rank-math-question">%s</h3><div class="rank-math-answer">%s</div></div>',
+                    $question_title,
+                    $answer_text
+                );
+
+                // Structure for the block's internal JSON attributes
+                $questions_for_block_attr[] = [
+                    'id' => 'faq-' . uniqid(),
+                    'visible' => true,
+                    'title' => $item['name'],
+                    'content' => $item['acceptedAnswer']['text']
+                ];
+            }
+        }
+        
+        if ( empty($faq_items_html) ) {
+            return '';
+        }
+
+        $block_attributes_json = json_encode(['questions' => $questions_for_block_attr]);
+
+        return '<!-- wp:rank-math/faq-block ' . $block_attributes_json . ' -->' .
+            '<div class="wp-block-rank-math-faq-block">' . $faq_items_html . '</div>' .
+            '<!-- /wp:rank-math/faq-block -->';
+    }
+
+    public function rest_import_callback( WP_REST_Request $request ) {
+        $auth_result = $this->authenticate_post_request( $request );
+        if ( is_wp_error( $auth_result ) ) return $auth_result;
+
+        $body = $auth_result['data'];
+        $author_id = $auth_result['author_id'];
+
+        $target_post_id = absint($body['target_post'] ?? 0);
+        $new_post_title = $body['post_title'] ?? '';
+        $new_post_content = $body['post_content'] ?? '';
+        $recipe_data = $body['recipe_data'] ?? null;
+        $faq_schema = $body['faqSchema'] ?? null;
+        $post_status = sanitize_key($body['post_status'] ?? 'publish');
+        $generation_type = $body['generation_type'] ?? 'intro';
+        
+        $focus_keyword = sanitize_text_field($body['focus_keyword'] ?? '');
+        $meta_description = sanitize_text_field($body['meta_description'] ?? '');
+        $slug = sanitize_title($body['slug'] ?? '');
+
+        if ( ! in_array($post_status, ['publish', 'draft']) ) {
+            $post_status = 'publish';
+        }
+
+        if ( ! is_array($recipe_data) ) {
+            return new WP_Error('missing_recipe_data', 'Recipe data is missing or invalid.', ['status' => 400]);
+        }
+
+        $is_new_post = false;
+        if ( $target_post_id === 0 ) {
+            if ( empty( $new_post_title ) ) {
+                return new WP_Error('missing_title', 'Post title cannot be empty when creating a new post.', ['status' => 400]);
+            }
+            $is_new_post = true;
+            $new_post_args = [
+                'post_type'    => 'post',
+                'post_title'   => sanitize_text_field($new_post_title),
+                'post_content' => '<!-- placeholder for recipe card -->',
+                'post_status'  => $post_status,
+                'post_author'  => $author_id,
+            ];
+            $new_post_id = wp_insert_post($new_post_args, true);
+
+            if (is_wp_error($new_post_id)) {
+                return $new_post_id;
+            }
+            $target_post_id = $new_post_id;
+        }
+
+        $existing_recipe_id = $this->get_existing_recipe_id_from_post($target_post_id);
+        $recipe_id_or_error = $this->save_recipe_data($recipe_data, $author_id, $target_post_id, $existing_recipe_id);
+
+        if (is_wp_error($recipe_id_or_error)) {
+            if ($is_new_post) {
+                // Clean up placeholder post if recipe fails
+                wp_trash_post($target_post_id);
+            }
+            return $recipe_id_or_error;
+        }
+        $recipe_id = $recipe_id_or_error;
+
+        $block_to_insert = '<!-- wp:wp-tasty/tasty-recipe {"id":' . intval($recipe_id) . ',"lastUpdated":' . round(microtime(true) * 1000) . '} /-->';
+        $post_obj = get_post($target_post_id);
+
+        $base_content = '';
+        if ($is_new_post || $generation_type === 'full') {
+            $base_content = $new_post_content;
+        } else {
+            // This case is for 'intro' on an existing post
+            $base_content = $post_obj->post_content;
+        }
+
+        // Remove any existing recipe card, faq blocks, and the FAQ headline to avoid duplication.
+        $content_sans_blocks = preg_replace('/<!-- wp:wp-tasty\\/tasty-recipe.*?\\/-->/s', '', $base_content);
+        $content_sans_blocks = preg_replace('/<!-- wp:rank-math\\/faq-block.*?\\/wp:rank-math\\/faq-block -->/s', '', $content_sans_blocks);
+        $content_sans_blocks = preg_replace('/<h2.*?>FAQs<\\/h2>/i', '', $content_sans_blocks);
+
+        // Part 1: The main article content.
+        $article_content = trim($content_sans_blocks);
+
+        // Part 2: The full FAQ section.
+        $faq_block = $this->build_faq_block_from_schema($faq_schema);
+        $faq_section = '';
+        if ( !empty($faq_block) ) {
+            $faq_section = "\n\n" . '<h2>FAQs</h2>' . "\n\n" . $faq_block;
+        }
+
+        // Now, assemble the final content.
+        $placement = get_option('recipepress_ai_insert_position', 'last');
+        $final_post_content = '';
+        
+        if ($placement === 'top') {
+            // Card first, then article, then FAQs.
+            $final_post_content = $block_to_insert . "\n\n" . $article_content . $faq_section;
+        } elseif ($placement === 'middle') {
+            // Insert card in the middle of the article, then add FAQs at the very end.
+            $paragraphs = preg_split('/(\\r\\n|\\n){2,}/', $article_content);
+            if (count($paragraphs) > 1) {
+                $insertion_point = floor(count($paragraphs) / 2);
+                if ($insertion_point === 0) $insertion_point = 1; // Ensure it's not at the very top
+                array_splice($paragraphs, $insertion_point, 0, $block_to_insert);
+                $article_with_card = implode("\n\n", $paragraphs);
+                $final_post_content = $article_with_card . $faq_section;
+            } else {
+                // Fallback for short articles: Article, Card, then FAQ.
+                $final_post_content = $article_content . "\n\n" . $block_to_insert . $faq_section;
+            }
+        } else { // 'last'
+            // Article, then FAQs, then Card at the very end. This is the user's specific request.
+            $final_post_content = $article_content . $faq_section . "\n\n" . $block_to_insert;
+        }
+        
+        $post_update_args = [
+            'ID' => $target_post_id,
+            'post_title' => sanitize_text_field($new_post_title),
+            'post_content' => $final_post_content,
+        ];
+
+        if ( ! empty($slug) ) {
+            $post_update_args['post_name'] = $slug;
+        }
+
+        if ($is_new_post) {
+            $post_update_args['post_status'] = $post_status;
+        } else {
+            // When updating, we always publish, unless the original post was a draft.
+            // The app logic sends 'publish' or 'draft' based on original status for updates.
+            // So we can trust the sent status here for updates too.
+            $post_update_args['post_status'] = $post_status;
+        }
+
+        $update_result = wp_update_post($post_update_args, true);
+
+        if (is_wp_error($update_result)) {
+            $this->log_debug('Final wp_update_post failed for target post ' . $target_post_id . ': ' . $update_result->get_error_message());
+            return $update_result;
+        }
+        
+        // Save SEO meta fields after the post is successfully updated
+        if ( ! empty($focus_keyword) ) {
+            // Support for both Yoast and Rank Math
+            update_post_meta($target_post_id, '_yoast_wpseo_focuskw', $focus_keyword);
+            update_post_meta($target_post_id, 'rank_math_focus_keyword', $focus_keyword);
+        }
+        if ( ! empty($meta_description) ) {
+            // Support for both Yoast and Rank Math
+            update_post_meta($target_post_id, '_yoast_wpseo_metadesc', $meta_description);
+            update_post_meta($target_post_id, 'rank_math_description', $meta_description);
+        }
+
+        $message = '';
+        if ($is_new_post) {
+            $message = $post_status === 'draft' ? 'New post saved as draft!' : 'New post published successfully!';
+        } else {
+            $message = 'Post updated successfully!';
+        }
+
+        $response_data = [
+            'success'   => true,
+            'message'   => $message,
+            'post_url'  => get_permalink($target_post_id),
+            'post_id'   => $target_post_id,
+            'recipe_id' => $recipe_id
+        ];
+        return new WP_REST_Response($response_data, 200);
+    }
+
+    private function get_post_details($p) {
+        $post_id = is_array($p) ? $p['ID'] : $p->ID;
+        $post_obj = get_post($post_id);
+
+        if (!$post_obj) return null;
+
+        $post_content = $post_obj->post_content;
+        $detail = $this->get_recipe_details_from_post_content($post_content, $post_id);
+
+        // Content analysis
+        $word_count = str_word_count(strip_tags($post_content));
+
+        preg_match_all('/<h([2-6]).*?>.*?<\\/h\\1>/i', $post_content, $matches);
+        $headline_counts = [];
+        if (!empty($matches[1])) {
+            foreach ($matches[1] as $level) {
+                $key = 'h' . $level;
+                if (!isset($headline_counts[$key])) {
+                    $headline_counts[$key] = 0;
+                }
+                $headline_counts[$key]++;
+            }
+        }
+
+        preg_match_all('/<img/i', $post_content, $image_matches);
+        $image_count = count($image_matches[0]);
+        
+        // Schema Detection
+        $has_recipe_schema = (strpos($post_content, '"@type":"Recipe"') !== false || strpos($post_content, '"@type": "Recipe"') !== false);
+        $has_faq_schema = (strpos($post_content, '"@type":"FAQPage"') !== false || strpos($post_content, '"@type": "FAQPage"') !== false || has_block('rank-math/faq-block', $post_content));
+
+        // Language
+        $language = get_locale();
+
+        // SEO Plugin Data
+        $yoast_kw = get_post_meta($post_id, '_yoast_wpseo_focuskw', true);
+        $rank_math_kw = get_post_meta($post_id, 'rank_math_focus_keyword', true);
+        $focus_keyword = $yoast_kw ?: ($rank_math_kw ?: null);
+        if (is_string($focus_keyword) && strpos($focus_keyword, ',') !== false) {
+            $keywords_array = array_map('trim', explode(',', $focus_keyword));
+            $focus_keyword = $keywords_array[0];
+        }
+
+        $yoast_desc = get_post_meta($post_id, '_yoast_wpseo_metadesc', true);
+        $rank_math_desc = get_post_meta($post_id, 'rank_math_description', true);
+        $meta_description = $yoast_desc ?: ($rank_math_desc ?: '');
+        $has_meta_description = !empty(trim($meta_description));
+
+        return [
+            'id' => $post_id,
+            'title' => $post_obj->post_title,
+            'link' => get_permalink($post_id),
+            'post_status' => $post_obj->post_status,
+            'has_recipe' => $detail['has_card'],
+            'recipe_details' => $detail,
+            'featured_image_url' => get_the_post_thumbnail_url($post_id, 'thumbnail') ?: null,
+            'word_count' => $word_count,
+            'headline_counts' => (object)$headline_counts,
+            'image_count' => $image_count,
+            'has_recipe_schema' => $has_recipe_schema,
+            'has_faq_schema' => $has_faq_schema,
+            'language' => $language,
+            'focus_keyword' => $focus_keyword,
+            'has_meta_description' => $has_meta_description,
+        ];
+    }
+
+    public function get_posts_callback( WP_REST_Request $request ) {
+        try {
+            $auth = $this->authenticate_get_request( $request );
+            if ( is_wp_error( $auth ) ) return $auth;
+
+            $has_page = $request->get_param( 'page' ) !== null;
+            $has_per_page = $request->get_param( 'per_page' ) !== null;
+
+            if ( ! $has_page && ! $has_per_page ) {
+                $recent = wp_get_recent_posts( [ 'numberposts' => 250, 'post_status' => ['publish', 'draft'] ] );
+                $out = [];
+                foreach ( $recent as $rp ) {
+                    $details = $this->get_post_details($rp);
+                    if ($details) {
+                        $out[] = $details;
+                    }
+                }
+                return new WP_REST_Response( $out, 200 );
+            }
+
+            $page = max( 1, absint( $request->get_param( 'page' ) ) );
+            $per_page = min(max(1, absint($request->get_param('per_page') ?? 50)), 250);
+
+            $args = [
+                'posts_per_page' => $per_page, 'paged' => $page,
+                'post_status' => ['publish', 'draft'], 'post_type' => 'post',
+                'orderby' => 'ID', 'order' => 'DESC',
+            ];
+
+            $q = new WP_Query( $args );
+            $posts = $q->get_posts();
+            $posts_data = [];
+            foreach ( $posts as $p ) {
+                $details = $this->get_post_details($p);
+                 if ($details) {
+                    $posts_data[] = $details;
+                }
+            }
+
+            $resp = [
+                'posts' => $posts_data,
+                'total_posts' => (int) $q->found_posts, 'total_pages' => (int) $q->max_num_pages,
+                'page' => $page, 'per_page' => $per_page,
+            ];
+
+            $response = rest_ensure_response( $resp );
+            $response->header( 'X-WP-Total', (int) $q->found_posts );
+            $response->header( 'X-WP-TotalPages', (int) $q->max_num_pages );
+            return $response;
+        } catch ( Throwable $e ) {
+            $this->log_debug( 'get_posts_callback error: ' . $e->getMessage() . PHP_EOL . $e->getTraceAsString() );
+            return new WP_Error( 'internal_server_error', 'Internal server error', [ 'status' => 500 ] );
+        }
+    }
+
+    public function validate_positive_int( $value, $request, $param ) {
+        if ( $value === null || $value === '' ) return true;
+        return ( is_numeric( $value ) && intval( $value ) >= 1 );
+    }
+
+    public function validate_per_page( $value, $request, $param ) {
+        if ( $value === null || $value === '' ) return true;
+        if ( ! is_numeric( $value ) ) return false;
+        $v = intval( $value );
+        return ( $v >= 1 && $v <= 1000 );
+    }
+
+    public function get_post_content_callback( WP_REST_Request $request ) {
+        $auth_result = $this->authenticate_get_request( $request );
+        if ( is_wp_error( $auth_result ) ) return $auth_result;
+
+        $post_id = $request->get_param('id');
+        $post = get_post($post_id);
+        if ( ! $post || ! in_array( $post->post_status, ['publish', 'draft'] ) ) {
+            return new WP_Error('not_found', 'Post not found or is not published.', ['status' => 404]);
+        }
+
+        return new WP_REST_Response(['content' => $post->post_content, 'title' => $post->post_title], 200);
+    }
+
+    public function register_rest_routes() {
+        // This route handles CORS pre-flight OPTIONS requests for our entire namespace.
+        register_rest_route( 'recipepress-ai/v1', '/(.*?)', [
+            'methods'  => 'OPTIONS',
+            'callback' => function() {
+                return new WP_REST_Response( 'OK', 200 );
+            },
+            'permission_callback' => '__return_true',
+        ] );
+
+        register_rest_route( 'recipepress-ai/v1', '/verify-connection', [
+            'methods' => 'POST', 'callback' => [ $this, 'verify_connection_callback' ], 'permission_callback' => '__return_true'
+        ]);
+        register_rest_route( 'recipepress-ai/v1', '/import', [
+            'methods' => 'POST', 'callback' => [ $this, 'rest_import_callback' ], 'permission_callback' => '__return_true'
+        ]);
+        register_rest_route( 'recipepress-ai/v1', '/posts', [
+            'methods' => 'GET',
+            'callback' => [ $this, 'get_posts_callback' ],
+            'permission_callback' => '__return_true',
+            'args' => [
+                'page' => ['required' => false, 'validate_callback' => [ $this, 'validate_positive_int' ], 'sanitize_callback' => 'absint'],
+                'per_page' => ['required' => false, 'validate_callback' => [ $this, 'validate_per_page' ], 'sanitize_callback' => 'absint'],
+            ],
+        ]);
+        register_rest_route( 'recipepress-ai/v1', '/post/(?P<id>\\d+)', [
+            'methods' => 'GET', 'callback' => [ $this, 'get_post_content_callback' ], 'permission_callback' => '__return_true'
+        ]);
+    }
+}
+
+RecipePress_AI_Connector_Remote::instance();
+?>
